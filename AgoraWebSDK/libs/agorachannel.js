@@ -52,6 +52,7 @@ class AgoraChannel {
     this.videoEnabled = pubVideo;
     this.audioSubscribing = subAudio;
     this.videoSubscribing = subVideo;
+    console.log("AV control set");
   }
 
   getConnectionState() {
@@ -88,10 +89,7 @@ class AgoraChannel {
     const id = user.uid;
     event_manager.raiseChannelOnUserJoined_MC(id, this.options.channel);
     event_manager.raiseCustomMsg("New User Joined: " + id);
-
-    if(this.spatialAudio !== undefined && this.spatialAudio.enabled === true){
-      this.enableSpatialAudio(true, user);
-    }
+    
   }
 
   async handleUserPublished(user, mediaType) {
@@ -140,8 +138,11 @@ class AgoraChannel {
         strUID
       );
     }
+    
     if (mediaType === "audio") {
       user.audioTrack.play();
+      console.log("working here...", this.spatialAudio);
+      this.spatialAudio.pipeRemoteUserSpatialAudioProcessor(user);
     }
   }
 
@@ -169,6 +170,7 @@ class AgoraChannel {
   }
 
   async setupLocalVideoTrack() {
+    console.log(localTracks.videoTrack);
     if (localTracks != undefined && localTracks.videoTrack == undefined) {
       [localTracks.videoTrack] = await Promise.all([
         AgoraRTC.createCameraVideoTrack().catch(error => {
@@ -184,11 +186,19 @@ class AgoraChannel {
 
   async setupLocalAudioTrack() {
     if (localTracks != undefined && localTracks.audioTrack == undefined) {
+      if(audio_profile != undefined){
       [localTracks.audioTrack] = await Promise.all([
-        AgoraRTC.createMicrophoneAudioTrack().catch(e => {
+        AgoraRTC.createMicrophoneAudioTrack({encoderConfig: audio_profile,}).catch(e => {
           event_manager.raiseHandleChannelError(e.code, e.message);
         }),
       ]);
+      } else {
+        [localTracks.audioTrack] = await Promise.all([
+          AgoraRTC.createMicrophoneAudioTrack().catch(e => {
+            event_manager.raiseHandleChannelError(e.code, e.message);
+          })
+        ])
+      }
     }
   }
 
@@ -283,7 +293,6 @@ class AgoraChannel {
     // this.client.removeAllListeners("error");
     // this.client.removeAllListeners("volume-indicator");
     // this.client.removeAllListeners("stream-message");
-
     // add event listener to play remote tracks when remote user publishs.
     this.client.on("user-joined", this.userJoinedHandle);
     this.client.on("user-published", this.userPublishedHandle);
@@ -305,10 +314,27 @@ class AgoraChannel {
       ),
     ]);
 
+    AgoraRTC.onCameraChanged = async (info) => {
+      console.log("onCameraChanged fired", info);
+      await cacheVideoDevices();
+      event_manager.raiseOnCameraChanged(info);
+    };
+
+    AgoraRTC.onMicrophoneChanged = async (info) => {
+      console.log("onMicrophoneChanged fired", info);
+      await cacheMicrophones();
+      event_manager.raiseOnMicrophoneChanged(info);
+    };
+
+    AgoraRTC.onPlaybackDeviceChanged = async (info) => {
+      console.log("onPlaybackChanged fired", info);
+      await cachePlaybackDevices();
+      event_manager.raiseOnPlaybackDeviceChanged(info);
+    };
+
     if (this.client_role === 1 && this.videoEnabled) {
       await this.setupLocalVideoTrack();
       if (localTracks != undefined && localTracks.videoTrack != undefined) {
-        localTracks.videoTrack.play("local-player");
         await this.client.publish(localTracks.videoTrack);
       } 
       this.is_publishing = true;
@@ -321,6 +347,8 @@ class AgoraChannel {
       }
       this.is_publishing = true;
     }
+
+    
 
     multiclient_connections++;
     event_manager.raiseJoinChannelSuccess_MC(
@@ -346,18 +374,15 @@ class AgoraChannel {
         this.client.unpublish(localTracks.videoTrack);
         localTracks.videoTrack = undefined;
       }
-      if (localTracks != undefined) {
-
-        for (var i = 0; i < localTracks.length; i++) {
-          localTracks[i].unpipe();
-          localTracks[i].stop();
-          localTracks[i].close();
-          this.client.unpublish(localTracks[i])
-        }
-        //localTracks = undefined;
+      if (localTracks != undefined && localTracks.audioTrack != undefined) {
+        
+          localTracks.audioTrack.unpipe();
+          localTracks.audioTrack.stop();
+          localTracks.audioTrack.close();
+          this.client.unpublish(localTracks.audioTrack);
+          localTracks.audioTrack = undefined;
       }
 
-      
     }
 
     if(this.virtualBackgroundProcessor !== null){
@@ -643,37 +668,52 @@ class AgoraChannel {
 
   // Must/Unmute local audio (mic)
   async muteLocalAudioStream(mute) {
-    if (mute) {
-      if (localTracks.audioTrack) {
-        await this.client.unpublish(localTracks.audioTrack);
-      }
-    } else {
-      if (localTracks.audioTrack) {
-        await this.client.publish(localTracks.audioTrack);
-      }
+    var muted = mute == 1 ? true : false;
+    if (localTracks.audioTrack) {
+      await localTracks.audioTrack.setMuted(muted);
     }
-    this.audioEnabled = !mute;
+    
+    this.audioEnabled = !muted;
   }
 
   // Stops/Resumes sending the local video stream.
   async muteLocalVideoStream(mute) {
+    var muted = mute == 1 ? true : false;
     if (this.client && !this.is_screensharing) {
-      if (mute) {
-        if (localTracks.videoTrack) {
-         await localTracks.videoTrack.setMuted(true);
-        }
-        
-      } else {
-        
-        if (localTracks.videoTrack) {
-          await localTracks.videoTrack.setMuted(false);
-        }
-        
-        await localTracks.videoTrack.setMuted(false);
+      if (localTracks.videoTrack) {
+        await localTracks.videoTrack.setMuted(muted);
       }
-      this.videoEnabled = !mute;
+        
     }
+      this.videoEnabled = !muted;
   }
+
+  async enableLocalVideo(enabled) {
+    var enable = enabled == 1 ? true : false;
+    console.log("EnableLocalVideo (agoraChannel):" + enable);
+    if (this.client) {
+
+      if(localTracks.videoTrack != null){
+        localTracks.videoTrack.setEnabled(enable);
+      }
+
+    }
+    this.videoEnabled = enable;
+  }
+
+  async enableLocalAudio(enabled) {
+    var enable = enabled == 1 ? true : false;
+    console.log("EnableLocalVideo (agoraChannel):" + enable);
+    if (this.client) {
+
+      if(localTracks.audioTrack != null){
+        localTracks.audioTrack.setEnabled(enable);
+      }
+
+    }
+    this.audioEnabled = enable;
+  }
+
   muteRemoteAudioStream(uid, mute) {
     Object.keys(this.remoteUsers).forEach((uid2) => {
 
@@ -990,18 +1030,20 @@ class AgoraChannel {
     setBackgroundVideo(this.virtualBackgroundProcessor, localTracks.videoTrack, videoFile);
   }
 
-  async enableSpatialAudio(enabled, client = this.client){
-    
-    if(client.uid === this.client.uid){
-      if(this.spatialAudio == undefined){
+  async enableSpatialAudio(user)
+  {
+    if(this.spatialAudio){
         this.spatialAudio = window.createSpatialAudioManager();
-      }
-    } else {
-      await this.spatialAudio.getRemoteUserSpatialAudioProcessor(client, enabled);
     }
   }
 
+  async initializeSpatialAudioManager_mc(){
+    this.spatialAudio = window.createSpatialAudioManager();
+    console.log("enabled multichannel spatial audio....");
+  }
+
   async setRemoteUserSpatialAudioParams(uid, azimuth, elevation, distance, orientation, attenuation, blur, airAbsorb){
+    console.log("set spatial audio params", uid);
     this.spatialAudio.updateSpatialAzimuth(uid, azimuth);
     this.spatialAudio.updateSpatialElevation(uid, elevation);
     this.spatialAudio.updateSpatialDistance(uid, distance);
